@@ -54,3 +54,9 @@ Get-Content -LiteralPath $latest.FullName -Encoding UTF8 -Tail 8
 | `stopped` | 执行中止，退出码为 2。记录包含原因，以及中止时已知的区域、游戏和最近事件。 |
 
 可用 `python -m unittest -v` 在电脑上运行离线回归测试。
+
+### 2026-11-19 实机记录
+
+10:39（北京时间）完成三个区域的最后一次复查。好游推荐最初的 4 张奖励卡均已清除金币标识，小编精选的当前卡片均无金币标识，热门内容最初的 10 张奖励卡均已清除标识并扫到列表末尾。三个区域的 `section_checked.still_marked` 均为空，手机随后回到游戏中心首屏。本次按页面金币标识验收。复查日志保存在本地 `runs/20261119-103710-31560.jsonl`。
+
+本次遇到插屏导致界面树读取失败、小编精选保留被替换的卡片节点，以及热门内容显示「任务已完成」时仍有金币卡片。对应优化已推送到 GitHub 的 `main` 分支，提交为 [`3016d92`](https://github.com/yufish123-Gmail/Mgame-GCent-auto-tasks/commit/3016d927e2aeb6bd7b6d738beb72b34cd2aaec23)。该版本 9 项离线回归测试全部通过，实机复测待下次连接手机后进行。
