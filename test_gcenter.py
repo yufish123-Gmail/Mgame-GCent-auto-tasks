@@ -1,4 +1,4 @@
-"""Regression cases reconstructed from the November 19 device run."""
+"""Regression cases reconstructed from device runs."""
 import subprocess
 import unittest
 import xml.etree.ElementTree as ET
@@ -58,6 +58,26 @@ class GameCenterTests(unittest.TestCase):
                                        "<?xml version='1.0'?><hierarchy></hierarchy>"])
         self.assertEqual(phone.tree().tag, "hierarchy")
         self.assertEqual(phone.call.call_count, 3)
+
+    @patch("gcenter.time.sleep")
+    def test_desktop_prompt_dismisses_only_in_execute_mode(self, _sleep):
+        phone = object.__new__(g.Phone)
+        phone.activity = Mock(return_value=(g.PKG, g.CENTER))
+        phone.input = Mock()
+        blocked = home_tree()
+        node(blocked, "桌面入口提示")
+        node(blocked, "立即领", bounds="[560,2100][950,2200]")
+        node(blocked, "不需要", bounds="[100,2100][500,2200]")
+        phone.tree = Mock(return_value=blocked)
+        phone.log = None
+        with self.assertRaisesRegex(RuntimeError, "桌面入口提示"):
+            phone.page()
+        phone.input.assert_not_called()
+        phone.log = Mock()
+        phone.tree.side_effect = [blocked, home_tree()]
+        self.assertIsInstance(phone.page(), g.Page)
+        phone.input.assert_called_once_with(g.CENTER, "tap", 300, 2150)
+        phone.log.assert_called_once_with("center_prompt_dismissed", title="桌面入口提示")
 
     @patch("gcenter.time.sleep")
     def test_disappearance_from_hot_view_is_inconclusive(self, _sleep):
@@ -127,6 +147,39 @@ class GameCenterTests(unittest.TestCase):
         self.assertEqual(elapsed[0], 26)
         log.assert_called_once_with("ad_closed", remaining=2)
 
+    @patch("gcenter.visual_button")
+    @patch("gcenter.time.sleep")
+    def test_ad_redirect_while_reading_tree_restores_original_task(self, _sleep, visual):
+        phone = Mock()
+        ad = "com.windmill.sdk.widget.InterstitialView_4012001"
+        current = g.PKG, ad
+        external = "com.android.browser", "com.android.browser.BrowserActivity"
+        phone.call.return_value = f"* Hist #3: ActivityRecord{{abc u0 {g.PKG}/{ad} t548}}"
+        tree = ET.Element("hierarchy")
+        button = node(tree, "关闭", bounds="[828,644][894,689]")
+        button.attrib.update({"package": g.PKG, "resource-id": "tobid:id/tobid_interstitial_skip_text"})
+        phone.tree.return_value = tree
+        phone.activity.side_effect = [current, external, external, current, current, (g.PKG, g.GAME)]
+        log = Mock()
+        self.assertTrue(g.close_interstitial(phone, current, log))
+        visual.assert_not_called()
+        phone.call.assert_any_call("shell", "am", "task", "focus", "548")
+        phone.input.assert_called_once_with(ad, "tap", 861, 666)
+        log.assert_called_once_with("ad_redirect_recovered", activity=ad, redirect_package=external[0])
+
+    @patch("gcenter.time.sleep")
+    def test_early_return_to_meituan_home_reopens_game_center(self, _sleep):
+        phone = Mock()
+        phone.activity.side_effect = [(g.PKG, g.MAIN), (g.PKG, g.MAIN), (g.PKG, g.CENTER)]
+        tree = ET.Element("hierarchy")
+        node(tree, "游戏中心", bounds="[600,1900][730,2150]")
+        phone.tree.return_value = tree
+        log = Mock()
+        g.play_seconds(phone, g.GAME, 122, log)
+        log.assert_called_once_with("game_returned_early", activity=g.MAIN, remaining=122)
+        g.return_to_center(phone, g.GAME)
+        phone.input.assert_called_once_with(g.MAIN, "tap", 665, 2025)
+
     @patch("gcenter.time.sleep")
     @patch("gcenter.Phone")
     def test_full_run_with_no_badges_returns_to_first_screen(self, phone_cls, _sleep):
@@ -170,6 +223,32 @@ class GameCenterTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "指尖幻影"):
             g.run(args, lambda event, **fields: events.append((event, fields)))
         self.assertEqual(events[-1][1]["unresolved"], {"指尖幻影": "still_marked"})
+
+    @patch("gcenter.time.sleep")
+    @patch("gcenter.badge_result", side_effect=["still_marked", "badge_removed"])
+    @patch("gcenter.return_to_center")
+    @patch("gcenter.play_seconds")
+    @patch("gcenter.wait_game", return_value=g.GAME)
+    @patch("gcenter.first_screen")
+    @patch("gcenter.prepare_center")
+    @patch("gcenter.Phone")
+    def test_retry_sweep_finds_card_hidden_by_pagination(self, phone_cls, _prepare, first_screen, *_mocks):
+        marked = g.Page(home_tree())
+        later = g.Page(home_tree())
+        later.cards["hot"][0].name = "另一款游戏"
+        later.cards["hot"][0].coins = 0
+        clear = g.Page(home_tree())
+        clear.cards["hot"][0].coins = 0
+        phone = phone_cls.return_value
+        phone.width, phone.height = 1080, 2400
+        phone.page.side_effect = [marked] + [later]*3 + [marked] + [clear]*4
+        args = SimpleNamespace(serial=None, section="hot", limit=0, execute=True)
+        events = []
+        g.run(args, lambda event, **fields: events.append((event, fields)))
+        self.assertEqual([f["attempt"] for e, f in events if e == "open"], [1, 2])
+        self.assertIn(("hot_retry_scan", {"games": ["指尖幻影"]}), events)
+        self.assertEqual(first_screen.call_count, 3)
+        self.assertEqual(events[-1], ("run_completed", {"sections": ["hot"], "rounds": 2}))
 
 
 if __name__ == "__main__":
