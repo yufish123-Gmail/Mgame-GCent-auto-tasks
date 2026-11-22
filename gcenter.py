@@ -15,6 +15,7 @@ PKG = "com.sankuai.meituan"
 CENTER = "com.sankuai.titans.adapter.mtapp.KNBWebViewActivity"
 GAME = "com.meituan.android.mgc.container.MGCGameActivity"
 MAIN = "com.meituan.android.pt.homepage.activity.MainActivity"
+AD_WEB = "com.sankuai.waimai.business.knb.WMMultiWebViewActivity"
 HEADERS = {"recommend": "好游推荐", "editor": "小编精选", "hot": "热门内容"}
 SECTION_SECONDS = {"recommend": 60, "editor": 80, "hot": 120}
 ROOT = Path(__file__).resolve().parent
@@ -37,6 +38,10 @@ def center_of(bounds):
 
 
 class ForegroundChanged(RuntimeError):
+    pass
+
+
+class GameTransitionError(RuntimeError):
     pass
 
 
@@ -156,9 +161,9 @@ class Phone:
         pkg, cls = m.groups()
         return pkg, pkg + cls if cls.startswith(".") else cls
 
-    def tree(self, compressed=False):
+    def tree(self, compressed=False, attempts=3):
         flags = ["--compressed"] if compressed else []
-        for attempt in range(3):
+        for attempt in range(attempts):
             try:
                 raw = self.call("exec-out", "uiautomator", "dump", *flags, "/dev/tty")
                 start, end = raw.find("<?xml"), raw.rfind("</hierarchy>")
@@ -167,9 +172,9 @@ class Phone:
                 reason = "界面树不完整"
             except (RuntimeError, ET.ParseError, subprocess.TimeoutExpired) as exc:
                 reason = str(exc)
-            if attempt < 2:
+            if attempt + 1 < attempts:
                 time.sleep(.5)
-        raise RuntimeError(f"连续三次未能读取完整界面树 ({reason})")
+        raise RuntimeError(f"尝试 {attempts} 次后仍未读取完整界面树 ({reason})")
 
     def page(self):
         dismissed = False
@@ -177,10 +182,11 @@ class Phone:
             if self.activity() != (PKG, CENTER):
                 raise RuntimeError("请打开美团游戏中心首页")
             tree = self.tree()
-            labels = {label(node) for node in tree.iter()}
+            labels = {label(node) for node in tree.iter() if center_of(box(node))}
             if {"桌面入口提示", "立即领"} <= labels:
-                buttons = [center_of(box(node)) for node in tree.iter() if label(node) == "不需要"]
-                if self.log is None or dismissed or len(buttons) != 1 or not buttons[0]:
+                buttons = [point for node in tree.iter() if label(node) == "不需要"
+                           and (point := center_of(box(node)))]
+                if self.log is None or dismissed or len(buttons) != 1:
                     raise RuntimeError("桌面入口提示遮挡游戏中心，请关闭弹窗后继续")
                 self.input(CENTER, "tap", *buttons[0])
                 self.log("center_prompt_dismissed", title="桌面入口提示")
@@ -238,8 +244,11 @@ def wait_game(phone):
         pkg, act = phone.activity()
         if pkg == PKG and is_game(act):
             return act
+        if pkg == PKG and (is_interstitial(act) or act == AD_WEB):
+            if not close_interstitial(phone, (pkg, act), phone.log):
+                break
         time.sleep(.65)
-    raise RuntimeError("未确认小游戏已在前台，未开始计时")
+    raise GameTransitionError("未确认小游戏已在前台，未开始计时")
 
 
 def visual_button(phone, filename, region):
@@ -261,7 +270,7 @@ def visual_button(phone, filename, region):
 
 
 def return_to_center(phone, act):
-    for _ in range(6):
+    for attempt in range(6):
         current = phone.activity()
         if current == (PKG, CENTER):
             return
@@ -277,29 +286,52 @@ def return_to_center(phone, act):
             if close_interstitial(phone, current):
                 continue
             break
-        point = visual_button(phone, "game_return.png", (350, 0, 432, 85))
-        if point:
-            phone.input(act, "tap", *point)
-            time.sleep(1.5)
-            continue
+        if attempt == 0:
+            point = visual_button(phone, "game_return.png", (350, 0, 432, 85))
+            if point:
+                phone.input(act, "tap", *point)
+                time.sleep(1.5)
+                continue
         try:
-            tree = phone.tree()
+            tree = phone.tree(compressed=True)
         except (RuntimeError, subprocess.TimeoutExpired):
             tree = None
-        buttons = [n for n in (tree.iter() if tree is not None else ()) if label(n) == "返回" and
+        nodes = list(tree.iter()) if tree is not None else []
+        labels = {label(n) for n in nodes if n.get("package") == PKG and center_of(box(n))}
+        restart_prompt = any(re.fullmatch(r"新版本已经准备好，(?:是否重启(?:应用|游戏)[？?]|请重启应用后继续[~～]?)", s)
+                             for s in labels)
+        if "更新提示" in labels and restart_prompt:
+            cancel = [point for n in nodes if n.get("package") == PKG and label(n) == "取消"
+                      and (point := center_of(box(n)))]
+            if len(cancel) == 1:
+                phone.input(act, "tap", *cancel[0])
+                time.sleep(.6)
+                point = visual_button(phone, "game_return.png", (350, 0, 432, 85))
+                if point and phone.activity() == current:
+                    phone.input(act, "tap", *point)
+                    time.sleep(1.2)
+                continue
+        buttons = [n for n in nodes if label(n) == "返回" and
                    n.get("package") == PKG and n.get("clickable") == "true" and
                    n.get("resource-id") == PKG + ":id/hao"]
         if len(buttons) == 1 and phone.activity() == current:
             x, y, right, bottom = box(buttons[0])
             phone.input(act, "tap", (x+right)//2, (y+bottom)//2)
         elif phone.activity() == current:
-            phone.input(act, "keyevent", "KEYCODE_BACK")
+            point = visual_button(phone, "game_return.png", (350, 0, 432, 85))
+            if point:
+                phone.input(act, "tap", *point)
+            else:
+                phone.input(act, "keyevent", "KEYCODE_BACK")
         time.sleep(1.5)
-    raise RuntimeError("游戏退出后未回到游戏中心")
+    if phone.activity() != (PKG, CENTER):
+        raise GameTransitionError("游戏退出后未回到游戏中心")
 
 
 def close_interstitial(phone, current, log=None):
     pkg, activity = current
+    if current == (PKG, AD_WEB):
+        return back_from_ad_web(phone, log)
     if pkg != PKG or not is_interstitial(activity):
         return False
     stack = phone.call("shell", "dumpsys", "activity", "activities")
@@ -317,7 +349,7 @@ def close_interstitial(phone, current, log=None):
             continue
         point = None
         try:
-            tree = phone.tree(compressed=True)
+            tree = phone.tree(compressed=True, attempts=1)
         except (RuntimeError, subprocess.TimeoutExpired):
             if "InterstitialView_" in activity and phone.activity() == current:
                 point = visual_button(phone, "interstitial_close.png", (285, 130, 385, 330))
@@ -327,6 +359,9 @@ def close_interstitial(phone, current, log=None):
             if len(close) == 1 and (close[0].get("resource-id", "").endswith("/tobid_interstitial_skip_text")
                                     or any(label(n) == "广告" for n in tree.iter())):
                 point = center_of(box(close[0]))
+        if (point is None and activity == "com.sigmob.sdk.base.common.PortraitTransparentAdActivity"
+                and phone.activity() == current):
+            point = visual_button(phone, "sigmob_close.png", (385, 48, 431, 108))
         if point is not None and phone.activity() == current:
             try:
                 phone.input(activity, "tap", *point)
@@ -350,6 +385,30 @@ def close_interstitial(phone, current, log=None):
     return after != current and after[0] == PKG
 
 
+def activity_history(phone):
+    stack = phone.call("shell", "dumpsys", "activity", "activities")
+    return re.findall(r"\* Hist\s+#\d+: ActivityRecord\{[^\n}]*?\s([\w.]+)/([\w.$]+) t(\d+)\b", stack)
+
+
+def back_from_ad_web(phone, log=None):
+    current = PKG, AD_WEB
+    entries = activity_history(phone)
+    for owner, activity, task in entries:
+        if (owner, activity) != current:
+            continue
+        chain = [a for p, a, t in entries if p == PKG and t == task]
+        if (len(chain) < 4 or chain[0] != AD_WEB or not is_interstitial(chain[1])
+                or not is_game(chain[2]) or chain[3] != CENTER):
+            continue
+        phone.input(AD_WEB, "keyevent", "KEYCODE_BACK")
+        time.sleep(.8)
+        if phone.activity() != current:
+            if log:
+                log("ad_web_closed", activity=AD_WEB)
+            return True
+    return False
+
+
 def play_seconds(phone, act, duration, log):
     remaining = duration
     deadline = time.monotonic() + max(180, duration * 6)
@@ -362,31 +421,38 @@ def play_seconds(phone, act, duration, log):
             raise RuntimeError("屏幕已休眠，请解锁手机后重新读取任务")
         if current == (PKG, act):
             remaining -= now - previous
-        elif current[0] == PKG and current[1] in (CENTER, MAIN):
-            log("game_returned_early", activity=current[1], remaining=round(remaining, 1))
-            return
-        elif time.monotonic() < deadline and close_interstitial(phone, current, log):
-            log("ad_closed", remaining=round(remaining, 1))
-            foreground = phone.activity()
+        else:
+            foreground = current
+            if time.monotonic() < deadline and close_interstitial(phone, current, log):
+                log("ad_closed", remaining=round(remaining, 1))
+                foreground = phone.activity()
+            # Launching a game can briefly bring the WebView back to the foreground.
+            for _ in range(6):
+                if foreground[0] != PKG or foreground[1] not in (CENTER, MAIN):
+                    break
+                time.sleep(.65)
+                foreground = phone.activity()
             if foreground[0] == PKG and foreground[1] in (CENTER, MAIN):
                 log("game_returned_early", activity=foreground[1], remaining=round(remaining, 1))
                 return
-            if foreground != (PKG, act) and not (foreground[0] == PKG and is_interstitial(foreground[1])):
-                raise RuntimeError(f"关闭插屏后未回到原游戏 {foreground}")
-        else:
-            raise RuntimeError(f"游戏离开前台，本轮计时中止 {current}")
+            ad_pending = foreground[0] == PKG and (is_interstitial(foreground[1]) or foreground[1] == AD_WEB)
+            if foreground != (PKG, act) and not ad_pending:
+                raise GameTransitionError(f"游戏离开前台，本轮计时中止 {foreground}")
+            if ad_pending and (foreground == current or time.monotonic() >= deadline):
+                raise GameTransitionError(f"未能关闭插屏 {foreground}")
         previous = time.monotonic()
 
 
 def prepare_center(phone, log):
     pkg, current = phone.activity()
+    if (pkg, current) == (PKG, AD_WEB) and back_from_ad_web(phone, log):
+        pkg, current = phone.activity()
     if (pkg, current) == (PKG, CENTER):
         return phone.page()
     if pkg != PKG or not (is_game(current) or is_interstitial(current)):
         raise RuntimeError(f"请打开游戏中心首页，当前前台为 {pkg}/{current}")
-    stack = phone.call("shell", "dumpsys", "activity", "activities")
     # Hist entries list each Android task from its foreground activity down.
-    entries = re.findall(r"\* Hist\s+#\d+: ActivityRecord\{[^\n}]*?\s([\w.]+)/([\w.$]+) t(\d+)\b", stack)
+    entries = activity_history(phone)
     for owner, activity, task in entries:
         if (owner, activity) != (pkg, current):
             continue
@@ -405,19 +471,19 @@ def first_screen(phone, page):
     for _ in range(40):
         y, bottom = page.anchors["recommend"][1::2]
         near_top = bottom > y and page.top <= y < page.bottom
-        phone.input(CENTER, "swipe", phone.width//2, int(phone.height*.23),
-                    phone.width//2, int(phone.height*.8), 230)
-        time.sleep(.8)
+        phone.input(CENTER, "swipe", phone.width//2, int(phone.height*.20),
+                    phone.width//2, int(phone.height*.82), 230)
+        time.sleep(.5)
         page = phone.page()
         if near_top and page.top <= page.anchors["recommend"][1] < page.bottom:
             return page
     raise RuntimeError("无法定位好游推荐，尚未确认扫描起点")
 
 
-def badge_result(phone, key, original, anchor=None):
+def badge_result(phone, key, original, anchor=None, initial_page=None):
     last = None
     for attempt in range(3):
-        page = phone.page()
+        page = initial_page if attempt == 0 and initial_page is not None else phone.page()
         cards = page.cards[key]
         matches = [c for c in cards if c.name == original.name]
         if matches:
@@ -429,11 +495,12 @@ def badge_result(phone, key, original, anchor=None):
         else:
             evidence = "card_not_located"
         if evidence == last and evidence in ("badge_removed", "slot_replaced"):
-            return evidence
+            return evidence, page
         last = evidence
         if attempt < 2:
-            time.sleep(1)
-    return last if last in ("still_marked", "card_not_located") else "unstable_page"
+            time.sleep(.6)
+    evidence = last if last in ("still_marked", "card_not_located") else "unstable_page"
+    return evidence, page
 
 
 def run(args, log):
@@ -447,7 +514,7 @@ def run(args, log):
     total = 0
     pending = set()
     log("run_started", serial=args.serial, sections=sections, limit=args.limit)
-    first_screen(phone, prepare_center(phone, log))
+    next_page = first_screen(phone, prepare_center(phone, log))
     for key in sections:
         log("section_started", section=key)
         attempts = {}
@@ -459,10 +526,13 @@ def run(args, log):
         pass_scrolls = 0
         retried_offscreen = False
         while True:
-            page = phone.page()
+            page = next_page if next_page is not None else phone.page()
+            next_page = None
             for seen in page.cards[key]:
                 if seen.name in unresolved and not seen.coins and page.point(seen, phone.width):
-                    if badge_result(phone, key, seen) == "badge_removed":
+                    evidence, updated_page = badge_result(phone, key, seen, initial_page=page)
+                    page = updated_page
+                    if evidence == "badge_removed":
                         del unresolved[seen.name]
                         log("confirmed", section=key, game=seen.name, evidence="later_badge_removed",
                             badge_removed=True)
@@ -484,12 +554,12 @@ def run(args, log):
                                     phone.width//2, int(phone.height*.36), 520)
                         scan_pages += 1
                         pass_scrolls += 1
-                        time.sleep(1)
+                        time.sleep(.5)
                         continue
                     retry_names = [name for name in unresolved if attempts.get(name, 0) < 2]
                     if retry_names and not retried_offscreen:
                         log("hot_retry_scan", games=retry_names)
-                        first_screen(phone, page)
+                        next_page = first_screen(phone, page)
                         retried_offscreen = True
                         last_scroll = None
                         still = pass_scrolls = 0
@@ -497,6 +567,7 @@ def run(args, log):
                 pending.update((key, name) for name in unresolved)
                 log("section_checked", section=key, still_marked=[c.name for c in eligible],
                     unresolved=dict(unresolved), scrolls=scan_pages, completion_label=key in page.completed)
+                next_page = page
                 break
             card = min(candidates, key=lambda c: (attempts.get(c.name, 0), page.point(c, phone.width) is None))
             point = page.point(card, phone.width)
@@ -511,13 +582,22 @@ def run(args, log):
             swipes = 0
             log("open", section=key, game=card.name, coins=card.coins, seconds=card.seconds,
                 duration_source=card.duration_source, attempt=attempts.get(card.name, 0)+1)
-            phone.input(CENTER, "tap", *point)
-            act = wait_game(phone)
-            duration = card.seconds + random.randint(1, 2)
-            log("foreground_timer", game=card.name, seconds=duration, activity=act)
-            play_seconds(phone, act, duration, log)
-            return_to_center(phone, act)
-            evidence = badge_result(phone, key, card, page.anchors[key])
+            interrupted = False
+            try:
+                phone.input(CENTER, "tap", *point)
+                act = wait_game(phone)
+                duration = card.seconds + random.randint(1, 2)
+                log("foreground_timer", game=card.name, seconds=duration, activity=act)
+                play_seconds(phone, act, duration, log)
+                return_to_center(phone, act)
+            except (GameTransitionError, ForegroundChanged) as exc:
+                interrupted = True
+                log("round_interrupted", section=key, game=card.name, reason=str(exc))
+                if phone.activity() == (PKG, MAIN):
+                    return_to_center(phone, GAME)
+                next_page = prepare_center(phone, log)
+                log("round_recovered", section=key, game=card.name)
+            evidence, next_page = badge_result(phone, key, card, page.anchors[key], initial_page=next_page)
             confirmed = evidence in ("badge_removed", "slot_replaced")
             if confirmed:
                 unresolved.pop(card.name, None)
@@ -526,7 +606,7 @@ def run(args, log):
             log("confirmed" if confirmed else "unconfirmed", section=key, game=card.name,
                 evidence=evidence, badge_removed=confirmed)
             attempts[card.name] = attempts.get(card.name, 0) + 1
-            if evidence == "still_marked" and attempts[card.name] == 2:
+            if evidence == "still_marked" and attempts[card.name] == 2 and not interrupted:
                 log("gameplay_check_needed", section=key, game=card.name,
                     reason="两轮复查仍有金币标识，可正常游玩一局后返回核对")
             total += 1
@@ -538,7 +618,7 @@ def run(args, log):
                 return
     if pending:
         raise RuntimeError(f"以下任务尚未确认结算 {sorted(pending)}")
-    first_screen(phone, phone.page())
+    first_screen(phone, next_page)
     log("run_completed", sections=sections, rounds=total)
 
 
@@ -559,7 +639,8 @@ def main():
             context["section"] = fields["section"]
         if event == "open":
             context["game"] = fields["game"]
-        if event in ("foreground_timer", "ad_closed", "ad_redirect_recovered", "game_returned_early"):
+        if event in ("foreground_timer", "ad_closed", "ad_redirect_recovered", "ad_web_closed",
+                     "game_returned_early"):
             fields.update({k: v for k, v in context.items() if k in ("section", "game")})
         if event == "stopped":
             fields.update(context)
