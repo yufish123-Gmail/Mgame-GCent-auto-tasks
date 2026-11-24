@@ -1,9 +1,11 @@
 """Regression cases reconstructed from device runs."""
 import subprocess
+import tempfile
 import unittest
 import xml.etree.ElementTree as ET
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import gcenter as g
 
@@ -152,7 +154,21 @@ class GameCenterTests(unittest.TestCase):
         with patch("gcenter.time", clock), patch("gcenter.close_interstitial", side_effect=dismiss):
             g.play_seconds(phone, g.GAME, 4, log)
         self.assertEqual(elapsed[0], 26)
-        log.assert_called_once_with("ad_closed", remaining=2)
+        log.assert_called_once_with("ad_closed", remaining=2, handling_seconds=20)
+
+    @patch("gcenter.time.sleep")
+    def test_ad_closing_in_place_needs_no_task_history(self, _sleep):
+        phone = Mock()
+        ad = "com.windmill.sdk.widget.InterstitialView_4012001"
+        current = (g.PKG, ad)
+        phone.activity.side_effect = [current, current, (g.PKG, g.GAME)]
+        tree = ET.Element("hierarchy")
+        close = node(tree, "关闭", bounds="[828,644][894,689]")
+        close.attrib.update({"package": g.PKG, "resource-id": "tobid:id/tobid_interstitial_skip_text"})
+        phone.tree.return_value = tree
+        self.assertTrue(g.close_interstitial(phone, current))
+        phone.input.assert_called_once_with(ad, "tap", 861, 666)
+        phone.call.assert_not_called()
 
     @patch("gcenter.visual_button")
     @patch("gcenter.time.sleep")
@@ -214,6 +230,44 @@ class GameCenterTests(unittest.TestCase):
         phone.input.assert_called_once_with(g.AD_WEB, "keyevent", "KEYCODE_BACK")
 
     @patch("gcenter.time.sleep")
+    @patch("gcenter.activity_history")
+    def test_ad_web_uses_native_close_if_system_back_keeps_webview(self, history, _sleep):
+        phone = Mock(width=1080, height=2400)
+        ad = "com.windmill.sdk.widget.InterstitialView_4012003"
+        current = (g.PKG, g.AD_WEB)
+        history.return_value = [(g.PKG, activity, "1") for activity in (g.AD_WEB, ad, g.GAME, g.CENTER)]
+        phone.activity.side_effect = [current, (g.PKG, ad)]
+        tree = ET.Element("hierarchy")
+        close = node(tree, "", bounds="[105,104][232,236]")
+        close.attrib.update({"package": g.PKG, "clickable": "true", "resource-id": g.PKG + ":id/button_lr",
+                             "content-desc": "关闭按钮"})
+        phone.tree.return_value = tree
+        log = Mock()
+        self.assertTrue(g.back_from_ad_web(phone, log))
+        self.assertEqual([c.args for c in phone.input.call_args_list],
+                         [(g.AD_WEB, "keyevent", "KEYCODE_BACK"), (g.AD_WEB, "tap", 168, 170)])
+        log.assert_any_call("ad_web_toolbar_tapped", control="关闭按钮")
+
+    @patch("gcenter.time.sleep")
+    @patch("gcenter.activity_history")
+    @patch("gcenter.visual_button")
+    def test_confirm_only_update_can_return_from_restarted_game(self, visual, history, _sleep):
+        phone = Mock()
+        game, updated = (g.PKG, g.GAME), (g.PKG, g.GAME + "1")
+        phone.activity.side_effect = [game, updated, updated, (g.PKG, g.CENTER)]
+        history.side_effect = [[(*game, "1")], [(*updated, "1"), (g.PKG, g.CENTER, "1")]]
+        visual.side_effect = [(1, 1), (990, 102)]
+        tree = ET.Element("hierarchy")
+        for name, bounds in (("更新提示", "[400,1000][600,1100]"),
+                             ("新版本已经准备好，是否重启应用？", "[160,1150][910,1200]"),
+                             ("确认", "[140,1269][940,1406]")):
+            node(tree, name, bounds=bounds).set("package", g.PKG)
+        phone.tree.return_value = tree
+        g.return_to_center(phone, g.GAME)
+        self.assertEqual([c.args for c in phone.input.call_args_list],
+                         [(g.GAME, "tap", 540, 1337), (updated[1], "tap", 990, 102)])
+
+    @patch("gcenter.time.sleep")
     @patch("gcenter.Phone")
     def test_full_run_with_no_badges_returns_to_first_screen(self, phone_cls, _sleep):
         page = g.Page(home_tree())
@@ -230,7 +284,9 @@ class GameCenterTests(unittest.TestCase):
         scans = [fields for event, fields in events if event == "section_checked"]
         self.assertEqual([s["section"] for s in scans], list(g.HEADERS))
         self.assertEqual(scans[-1]["scrolls"], 2)
-        self.assertEqual(events[-1], ("run_completed", {"sections": list(g.HEADERS), "rounds": 0}))
+        self.assertEqual(events[-1], ("run_completed", {"sections": list(g.HEADERS), "rounds": 0,
+                                                        "elapsed_seconds": ANY}))
+        self.assertTrue(all(scan["elapsed_seconds"] >= 0 for scan in scans))
         last = phone.input.call_args.args
         self.assertEqual(last[:2], (g.CENTER, "swipe"))
         self.assertLess(last[3], last[5])
@@ -284,7 +340,8 @@ class GameCenterTests(unittest.TestCase):
         self.assertEqual([f["attempt"] for e, f in events if e == "open"], [1, 2])
         self.assertIn(("hot_retry_scan", {"games": ["指尖幻影"]}), events)
         self.assertEqual(first_screen.call_count, 3)
-        self.assertEqual(events[-1], ("run_completed", {"sections": ["hot"], "rounds": 2}))
+        self.assertEqual(events[-1], ("run_completed", {"sections": ["hot"], "rounds": 2,
+                                                        "elapsed_seconds": ANY}))
 
     @patch("gcenter.time.sleep")
     @patch("gcenter.return_to_center")
@@ -307,13 +364,30 @@ class GameCenterTests(unittest.TestCase):
         phone.page.side_effect = [marked, marked, clear, clear]
         args = SimpleNamespace(serial=None, section="recommend", limit=0, execute=True)
         events = []
-        g.run(args, lambda event, **fields: events.append((event, fields)))
+        diagnostic = Mock()
+        g.run(args, lambda event, **fields: events.append((event, fields)), diagnostic=diagnostic)
         self.assertEqual(prepare.call_count, 2)
+        diagnostic.assert_called_once_with(phone, "round_interrupted")
         self.assertEqual(phone.page.call_count, 4)
         self.assertEqual(play.call_count, 1)
         self.assertEqual([fields["attempt"] for event, fields in events if event == "open"], [1, 2])
         self.assertIn("round_recovered", [event for event, _ in events])
-        self.assertEqual(events[-1], ("run_completed", {"sections": ["recommend"], "rounds": 2}))
+        self.assertEqual(events[-1], ("run_completed", {"sections": ["recommend"], "rounds": 2,
+                                                        "elapsed_seconds": ANY}))
+
+    def test_diagnostic_saves_png_and_reports_capture_failure(self):
+        phone = Mock()
+        png = b"\x89PNG\r\n\x1a\n"
+        phone.screenshot.side_effect = [png, subprocess.TimeoutExpired("adb", 12)]
+        log = Mock()
+        with tempfile.TemporaryDirectory() as tmp:
+            logfile = Path(tmp) / "run.jsonl"
+            g.save_diagnostic(phone, logfile, "round_interrupted", 1, log)
+            g.save_diagnostic(phone, logfile, "stopped", 2, log)
+            self.assertEqual((Path(tmp) / "run-001-round_interrupted.png").read_bytes(), png)
+            self.assertFalse((Path(tmp) / "run-002-stopped.png").exists())
+        log.assert_any_call("screenshot", state="round_interrupted", file="run-001-round_interrupted.png")
+        log.assert_any_call("screenshot_unavailable", state="stopped", reason=ANY)
 
 
 if __name__ == "__main__":
